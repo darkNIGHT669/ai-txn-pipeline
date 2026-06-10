@@ -3,7 +3,15 @@ set -euo pipefail
 
 # ── Wait for PostgreSQL ────────────────────────────────────────────────────
 echo "[entrypoint] Waiting for PostgreSQL at db:5432 ..."
-until pg_isready -h db -p 5432 -U txnuser -q; do
+until python -c "
+import socket, sys
+try:
+    s = socket.create_connection(('db', 5432), timeout=2)
+    s.close()
+    sys.exit(0)
+except OSError:
+    sys.exit(1)
+" 2>/dev/null; do
   echo "[entrypoint] Postgres not ready — retrying in 2s ..."
   sleep 2
 done
@@ -11,7 +19,14 @@ echo "[entrypoint] PostgreSQL is ready."
 
 # ── Wait for Redis ─────────────────────────────────────────────────────────
 echo "[entrypoint] Waiting for Redis at redis:6379 ..."
-until curl -s redis:6379 > /dev/null 2>&1 || python -c "import redis; redis.Redis(host='redis', port=6379).ping()" 2>/dev/null; do
+until python -c "
+import redis, sys
+try:
+    redis.Redis(host='redis', port=6379).ping()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; do
   echo "[entrypoint] Redis not ready — retrying in 2s ..."
   sleep 2
 done
