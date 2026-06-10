@@ -1,84 +1,142 @@
-# AI-Powered Transaction Processing Pipeline
+# 🏦 AI-Powered Transaction Processing Pipeline
 
-A production-ready, containerised backend that ingests dirty financial CSVs, cleans them, detects anomalies, classifies transactions with an LLM, and returns a structured summary — all processed asynchronously through a job queue.
+> A production-ready, fully containerised backend that ingests dirty financial CSVs, cleans them, detects anomalies, classifies transactions with an LLM, and returns a structured summary — all processed asynchronously through a job queue.
 
 ---
 
-## Architecture
+## 🏗️ System Architecture
 
 ```
-Client
-  │
-  ▼
-FastAPI (port 8000)
-  │  POST /jobs/upload → saves CSV → creates Job (pending) → enqueues task
-  │
-  ▼
-Redis (broker + result backend)
-  │
-  ▼
-Celery Worker
-  │  1. Data Cleaning      (pandas)
-  │  2. Anomaly Detection  (statistical + cross-border)
-  │  3. LLM Classification (Gemini 1.5 Flash — batched)
-  │  4. LLM Narrative      (Gemini 1.5 Flash — single call)
-  │  5. Persist results
-  ▼
-PostgreSQL
-  └── jobs, transactions, job_summaries
+                        ┌─────────────────────────────────────────────────────┐
+                        │                  Docker Network                      │
+                        │                                                       │
+  ┌──────────┐          │  ┌─────────────┐        ┌──────────────────────────┐ │
+  │          │  POST    │  │             │ enqueue │                          │ │
+  │  Client  │─────────▶│  │  FastAPI    │────────▶│  Redis (Broker/Backend)  │ │
+  │ (curl /  │  /jobs/  │  │  :8000      │         │  :6379                   │ │
+  │  Swagger)│  upload  │  │             │         └──────────┬───────────────┘ │
+  │          │          │  │  • Validate │                    │ dequeue         │
+  │          │◀─────────│  │  • Save Job │                    ▼                 │
+  │          │ job_id   │  │  • Return   │         ┌──────────────────────────┐ │
+  └──────────┘ (instant)│  │   job_id   │         │   Celery Worker          │ │
+                        │  └──────┬──────┘         │                          │ │
+                        │         │ async           │  Step 1: Data Cleaning   │ │
+  ┌──────────┐          │         │ poll            │  ├─ Normalize dates      │ │
+  │          │  GET     │         │                 │  ├─ Strip $ symbols      │ │
+  │  Client  │─────────▶│         │                 │  ├─ Uppercase status     │ │
+  │          │ /status  │         │                 │  └─ Drop duplicates      │ │
+  │          │ /results │         │                 │                          │ │
+  └──────────┘          │         │                 │  Step 2: Anomaly Det.    │ │
+                        │         │                 │  ├─ 3x median outlier    │ │
+                        │         │                 │  └─ Cross-border brand   │ │
+                        │         │                 │                          │ │
+                        │         │                 │  Step 3: LLM Classify    │ │
+                        │         │                 │  └─ Batched (20/call)    │ │
+                        │         │                 │      ┌───────────────┐   │ │
+                        │         │                 │      │  Gemini 1.5   │   │ │
+                        │         │                 │      │  Flash API    │   │ │
+                        │         │                 │      └───────────────┘   │ │
+                        │         │                 │                          │ │
+                        │         │                 │  Step 4: LLM Narrative   │ │
+                        │         │                 │  └─ Single summary call  │ │
+                        │         │                 │                          │ │
+                        │         │                 │  Step 5: Persist         │ │
+                        │         │                 └──────────┬───────────────┘ │
+                        │         │                            │ write           │
+                        │         │                            ▼                 │
+                        │         │                 ┌──────────────────────────┐ │
+                        │         └────────────────▶│   PostgreSQL :5432       │ │
+                        │           read results    │                          │ │
+                        │                           │  • jobs                  │ │
+                        │                           │  • transactions          │ │
+                        │                           │  • job_summaries         │ │
+                        │                           └──────────────────────────┘ │
+                        │                                                       │
+                        └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Tech Stack
+## 📊 Data Flow — Single Request Lifecycle
 
-| Layer | Technology |
-|---|---|
-| API | FastAPI 0.111 + Pydantic v2 |
-| Database | PostgreSQL 16 + SQLAlchemy 2 (async) |
-| Job Queue | Celery 5 + Redis 7 |
-| LLM | Google Gemini 1.5 Flash |
-| Containerisation | Docker + Docker Compose |
+```
+ Client                FastAPI              Redis            Celery Worker         PostgreSQL
+   │                      │                   │                    │                    │
+   │── POST /jobs/upload ─▶│                   │                    │                    │
+   │   (transactions.csv)  │                   │                    │                    │
+   │                       │── INSERT Job ────────────────────────────────────────────▶│
+   │                       │   status=pending  │                    │                    │
+   │                       │── enqueue task ──▶│                    │                    │
+   │◀── 202 { job_id } ────│                   │── deliver task ───▶│                    │
+   │                       │                   │                    │                    │
+   │                       │                   │                    │── UPDATE pending──▶│
+   │                       │                   │                    │   → processing     │
+   │                       │                   │                    │                    │
+   │                       │                   │                    │── clean CSV        │
+   │                       │                   │                    │── detect anomalies │
+   │                       │                   │                    │── LLM classify     │
+   │                       │                   │                    │── LLM narrative    │
+   │                       │                   │                    │                    │
+   │                       │                   │                    │── INSERT txns ────▶│
+   │                       │                   │                    │── INSERT summary ─▶│
+   │                       │                   │                    │── UPDATE completed▶│
+   │                       │                   │                    │                    │
+   │── GET /jobs/{id}/status▶│                  │                    │                    │
+   │◀── { completed, summary}│◀──────────────────────────────────────────────────────────│
+   │                       │                   │                    │                    │
+   │── GET /jobs/{id}/results▶│                 │                    │                    │
+   │◀── { transactions, anomalies, breakdown } ─────────────────────────────────────────│
+```
 
 ---
 
-## Quick Start
+## ⚙️ Tech Stack
 
-### 1. Prerequisites
-- Docker Desktop (or Docker Engine + Compose plugin)
-- A free [Google AI Studio](https://aistudio.google.com/app/apikey) API key
+| Layer | Technology | Why |
+|---|---|---|
+| API Framework | FastAPI 0.111 + Pydantic v2 | Async-first, auto-docs, fast validation |
+| Database | PostgreSQL 16 + SQLAlchemy 2 (async) | ACID compliance, JSONB for flexible fields |
+| Job Queue | Celery 5 + Redis 7 | Decouples upload from heavy processing |
+| LLM | Google Gemini 1.5 Flash | Free tier, fast, strong instruction following |
+| Data Processing | Pandas 2.2 | Vectorised cleaning, efficient groupby stats |
+| Containerisation | Docker + Docker Compose | Single-command boot, zero manual setup |
 
-### 2. Clone & Configure
+---
 
+## 🚀 Quick Start
+
+### Prerequisites
+- Docker Desktop
+- A free Gemini API key from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+
+### 1. Clone & configure
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/YOUR_USERNAME/ai-txn-pipeline.git
 cd ai-txn-pipeline
 cp .env.example .env
-# Edit .env and set GEMINI_API_KEY=<your key>
+# Open .env and set: GEMINI_API_KEY=your_key_here
 ```
 
-### 3. Boot the stack
-
+### 2. Boot everything
 ```bash
 docker compose up --build
 ```
 
-That's it. All four services (web, worker, redis, db) start, health checks pass, and the API is ready at `http://localhost:8000`.
+All four services start automatically with health checks. The API is live at `http://localhost:8000`.
 
 ---
 
-## API Reference
+## 📡 API Reference
 
-### Upload a CSV
+### `POST /jobs/upload`
+Upload a CSV file. Returns a `job_id` immediately.
 ```bash
 curl -X POST http://localhost:8000/jobs/upload \
   -F "file=@transactions.csv"
 ```
-
-Response:
 ```json
 {
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_id": "7c56b768-bd21-4d23-ac00-f0aed4584673",
   "status": "pending",
   "filename": "transactions.csv",
   "message": "Job enqueued successfully"
@@ -87,116 +145,146 @@ Response:
 
 ---
 
-### Poll job status
+### `GET /jobs/{job_id}/status`
+Poll for job status. Returns summary stats when completed.
 ```bash
-curl http://localhost:8000/jobs/550e8400-e29b-41d4-a716-446655440000/status
+curl http://localhost:8000/jobs/7c56b768-bd21-4d23-ac00-f0aed4584673/status
 ```
-
-Response when completed:
 ```json
 {
-  "job_id": "550e8400-...",
+  "job_id": "7c56b768-...",
   "status": "completed",
-  "row_count_raw": 90,
-  "row_count_clean": 87,
+  "row_count_raw": 95,
+  "row_count_clean": 85,
   "summary": {
-    "total_spend_inr": 450000.00,
-    "total_spend_usd": 3200.00,
-    "anomaly_count": 4,
-    "risk_level": "medium",
-    "narrative": "The account shows elevated spending across Food and Shopping categories...",
-    "top_merchants": [{"merchant": "Amazon", "total": 85000}]
+    "total_spend_inr": 1339923.0,
+    "total_spend_usd": 74185.14,
+    "anomaly_count": 15,
+    "risk_level": "high",
+    "top_merchants": [{"merchant": "IRCTC", "total": 450697.69}]
   }
 }
 ```
 
 ---
 
-### Get full results
+### `GET /jobs/{job_id}/results`
+Full structured output: cleaned transactions, flagged anomalies, category breakdown, narrative.
 ```bash
-curl http://localhost:8000/jobs/550e8400-e29b-41d4-a716-446655440000/results
+curl http://localhost:8000/jobs/7c56b768-bd21-4d23-ac00-f0aed4584673/results
 ```
-
-Returns:
-- `transactions[]` — all cleaned transactions with LLM categories
-- `anomalies[]` — subset flagged as anomalous
-- `category_breakdown[]` — spend totals per category
-- `summary` — LLM narrative + risk level
 
 ---
 
-### List all jobs
+### `GET /jobs`
+List all jobs. Supports `?status=` filter.
 ```bash
-# All jobs
 curl http://localhost:8000/jobs
-
-# Filter by status
 curl "http://localhost:8000/jobs?status=completed"
-curl "http://localhost:8000/jobs?status=failed"
 ```
 
 ---
 
-### Health check
-```bash
-curl http://localhost:8000/health
-```
+## 🔬 Processing Pipeline
 
----
+### Step 1 — Data Cleaning
+| Issue | Fix |
+|---|---|
+| Mixed dates (`DD-MM-YYYY`, `YYYY/MM/DD`) | Normalized to ISO 8601 |
+| Amount with `$` prefix | Stripped to plain float |
+| Inconsistent `status`/`currency` casing | Uppercased |
+| Blank `category` | Filled with `"Uncategorised"` |
+| Exact duplicate rows | Dropped |
 
-## Processing Pipeline Details
-
-### Data Cleaning
-- Normalises `DD-MM-YYYY` and `YYYY/MM/DD` dates → ISO 8601
-- Strips `$` and other currency symbols from amounts
-- Uppercases `status` and `currency` fields
-- Fills blank `category` with `"Uncategorised"`
-- Removes exact duplicate rows
-
-### Anomaly Detection
+### Step 2 — Anomaly Detection
 - **Statistical outlier**: `amount > 3 × median(amount)` for the same `account_id`
-- **Cross-border domestic brand**: `currency = USD` but merchant is Swiggy, Ola, IRCTC, Zomato, etc.
+- **Cross-border domestic brand**: `currency = USD` but merchant is Swiggy, Ola, IRCTC, Zomato, MakeMyTrip, etc.
 
-### LLM Classification (Gemini 1.5 Flash)
-- Batches uncategorised transactions (20 per call)
-- Categories: Food, Shopping, Travel, Transport, Utilities, Cash Withdrawal, Entertainment, Other
-- Exponential backoff retry (up to 3 attempts); if all fail, row is marked `llm_failed=true`
+### Step 3 — LLM Classification (Gemini 1.5 Flash)
+- Batches uncategorised transactions (20 per call) — never one call per row
+- Categories: `Food`, `Shopping`, `Travel`, `Transport`, `Utilities`, `Cash Withdrawal`, `Entertainment`, `Other`
+- Exponential backoff retry (2s → 4s → 8s); marks `llm_failed=true` gracefully on failure
 
-### LLM Narrative (single call)
-- Generates JSON with total spend breakdown, top 3 merchants, anomaly count, 2–3 sentence narrative, and `risk_level` (low/medium/high)
+### Step 4 — LLM Narrative Summary
+- Single call producing: total spend by currency, top 3 merchants, anomaly count, 2–3 sentence narrative, `risk_level` (low / medium / high)
 
 ---
 
-## Scalability Considerations
+## 🗄️ Database Schema
 
-| Bottleneck | Current | Fix at 100× |
+```
+┌─────────────────────────┐       ┌──────────────────────────────┐
+│          jobs           │       │        transactions           │
+├─────────────────────────┤       ├──────────────────────────────┤
+│ id          UUID  PK    │──┐    │ id           INT   PK        │
+│ filename    VARCHAR     │  │    │ job_id       UUID  FK        │
+│ status      VARCHAR IDX │  └───▶│ txn_id       VARCHAR         │
+│ row_count_raw  INT      │       │ date         VARCHAR         │
+│ row_count_clean INT     │       │ merchant     VARCHAR         │
+│ created_at  TIMESTAMP   │       │ amount       NUMERIC         │
+│ completed_at TIMESTAMP  │       │ currency     VARCHAR         │
+│ error_message TEXT      │       │ status       VARCHAR         │
+└─────────────────────────┘       │ category     VARCHAR         │
+            │                     │ account_id   VARCHAR  IDX    │
+            │                     │ is_anomaly   BOOLEAN         │
+            │                     │ anomaly_reason TEXT          │
+            │                     │ llm_category VARCHAR         │
+            │                     │ llm_failed   BOOLEAN         │
+            │                     └──────────────────────────────┘
+            │
+            │          ┌──────────────────────────────┐
+            │          │        job_summaries          │
+            │          ├──────────────────────────────┤
+            └─────────▶│ id           INT   PK        │
+                       │ job_id       UUID  FK        │
+                       │ total_spend_inr NUMERIC      │
+                       │ total_spend_usd NUMERIC      │
+                       │ top_merchants   JSONB        │
+                       │ anomaly_count   INT          │
+                       │ narrative       TEXT         │
+                       │ risk_level      VARCHAR      │
+                       └──────────────────────────────┘
+```
+
+---
+
+## ⚠️ Scalability — Bottlenecks & Fixes
+
+| Bottleneck | Breaks at 100× Because | Production Fix |
 |---|---|---|
-| File ingestion | In-memory pandas | Stream upload to S3; chunked CSV parse in worker |
-| DB connections | SQLAlchemy pool (10) | Add PgBouncer; tune `pool_size` |
-| LLM rate limits | Sequential batches | Token-bucket rate limiter at worker layer; async Celery beat |
-| Single worker | 2 concurrent tasks | Horizontal Celery worker replicas; task routing |
+| **In-memory CSV parsing** | Entire file loaded into Pandas on the worker; large files OOM the container | Stream upload to S3/GCS; worker reads in chunks via `pd.read_csv(chunksize=1000)` |
+| **DB connection pool** | SQLAlchemy pool (10 connections) exhausted under concurrent load | Add **PgBouncer** as connection pooler; index `account_id` and `job_id` |
+| **LLM rate limits** | Gemini free tier enforces RPM/TPM limits; bulk batches trigger HTTP 429 | Token-bucket rate limiter at Celery layer; async task throttling via `celery beat` |
+| **Single worker** | One worker processes one job at a time; queue backs up | Horizontal worker replicas: `docker compose --scale worker=N`; separate priority queues |
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 ai-txn-pipeline/
 ├── app/
-│   ├── main.py           # FastAPI routes
-│   ├── config.py         # Settings (pydantic-settings)
-│   ├── database.py       # Async SQLAlchemy engine
-│   ├── models.py         # ORM: Job, Transaction, JobSummary
-│   ├── schemas.py        # Pydantic v2 request/response schemas
-│   ├── tasks.py          # Celery task + pipeline orchestration
+│   ├── main.py                 # FastAPI routes (4 endpoints)
+│   ├── config.py               # pydantic-settings env config
+│   ├── database.py             # Async SQLAlchemy engine + session
+│   ├── models.py               # ORM: Job, Transaction, JobSummary
+│   ├── schemas.py              # Pydantic v2 request/response schemas
+│   ├── tasks.py                # Celery app + pipeline orchestration
 │   └── services/
-│       ├── data_cleaner.py     # CSV normalisation
-│       ├── anomaly_detector.py # Outlier & cross-border detection
-│       └── llm_processor.py    # Gemini batched calls + narrative
-├── docker-compose.yml
-├── Dockerfile
-├── entrypoint.sh         # Wait-for-db + start web or worker
+│       ├── data_cleaner.py     # Date/amount/status normalization
+│       ├── anomaly_detector.py # Statistical + cross-border detection
+│       └── llm_processor.py   # Gemini batched calls + retry logic
+├── docker-compose.yml          # 4-service orchestration
+├── Dockerfile                  # Multi-stage Python 3.11 slim
+├── entrypoint.sh               # Wait-for-db + web/worker branching
 ├── requirements.txt
-├── transactions.csv      # Sample data
-└── .env.example
+├── transactions.csv            # Sample data
+└── .env.example                # Template — copy to .env and add GEMINI_API_KEY
 ```
+
+---
+
+
+
+## 📹 Technical Walkthrough
+[Watch on Loom](#) <!-- Replace with your Loom video link -->
