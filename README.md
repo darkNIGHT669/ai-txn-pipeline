@@ -284,7 +284,8 @@ ai-txn-pipeline/
 
 ---
 
-
+## 🔗 Architecture Diagram
+[View on draw.io](https://drive.google.com/file/d/1PI2sSve6rY_eP6aFw90js1BhCY6ytIFk/view)
 
 ## 📹 Technical Walkthrough
-[Watch on Loom](#) <!-- Replace with your Loom video link -->
+[Watch on Loom](https://www.loom.com/share/1ed1bf90b2064358980c03ddd6a4ebf9) 
